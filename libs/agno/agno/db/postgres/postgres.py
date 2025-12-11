@@ -2089,7 +2089,7 @@ class PostgresDb(BaseDb):
             Exception: If an error occurs during deletion.
         """
         try:
-            table = self._get_table(table_type="culture")
+            table = self._get_table(table_type="culture", create_table_if_not_found=True)
             if table is None:
                 return
 
@@ -2110,7 +2110,7 @@ class PostgresDb(BaseDb):
             Exception: If an error occurs during deletion.
         """
         try:
-            table = self._get_table(table_type="culture")
+            table = self._get_table(table_type="culture", create_table_if_not_found=True)
             if table is None:
                 return
 
@@ -2144,7 +2144,7 @@ class PostgresDb(BaseDb):
             Exception: If an error occurs during retrieval.
         """
         try:
-            table = self._get_table(table_type="culture")
+            table = self._get_table(table_type="culture", create_table_if_not_found=True)
             if table is None:
                 return None
 
@@ -2196,7 +2196,7 @@ class PostgresDb(BaseDb):
             Exception: If an error occurs during retrieval.
         """
         try:
-            table = self._get_table(table_type="culture")
+            table = self._get_table(table_type="culture", create_table_if_not_found=True)
             if table is None:
                 return [] if deserialize else ([], 0)
 
