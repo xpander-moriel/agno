@@ -1,7 +1,8 @@
+import json
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Type, Union
 
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.routing import APIRoute, APIRouter
 from pydantic import BaseModel, create_model
 from starlette.middleware.cors import CORSMiddleware
@@ -13,11 +14,166 @@ from agno.media import Audio, Image, Video
 from agno.media import File as FileMedia
 from agno.models.message import Message
 from agno.os.config import AgentOSConfig
+from agno.run.agent import RunOutputEvent
+from agno.run.team import TeamRunOutputEvent
+from agno.run.workflow import WorkflowRunOutputEvent
 from agno.team.team import Team
 from agno.tools import Toolkit
 from agno.tools.function import Function
-from agno.utils.log import logger
+from agno.utils.log import log_warning, logger
 from agno.workflow.workflow import Workflow
+
+
+async def get_request_kwargs(request: Request, endpoint_func: Callable) -> Dict[str, Any]:
+    """Given a Request and an endpoint function, return a dictionary with all extra form data fields.
+
+    Args:
+        request: The FastAPI Request object
+        endpoint_func: The function exposing the endpoint that received the request
+
+    Supported form parameters:
+        - session_state: JSON string of session state dict
+        - dependencies: JSON string of dependencies dict
+        - metadata: JSON string of metadata dict
+        - knowledge_filters: JSON string of knowledge filters
+        - output_schema: JSON schema string (converted to Pydantic model by default)
+        - use_json_schema: If "true", keeps output_schema as dict instead of converting to Pydantic model
+
+    Returns:
+        A dictionary of kwargs to pass to Agent/Team run methods
+    """
+    import inspect
+
+    form_data = await request.form()
+    sig = inspect.signature(endpoint_func)
+    known_fields = set(sig.parameters.keys())
+    kwargs: Dict[str, Any] = {key: value for key, value in form_data.items() if key not in known_fields}
+
+    # Handle JSON parameters. They are passed as strings and need to be deserialized.
+    if session_state := kwargs.get("session_state"):
+        try:
+            if isinstance(session_state, str):
+                session_state_dict = json.loads(session_state)  # type: ignore
+                kwargs["session_state"] = session_state_dict
+        except json.JSONDecodeError:
+            kwargs.pop("session_state")
+            log_warning(f"Invalid session_state parameter couldn't be loaded: {session_state}")
+
+    if dependencies := kwargs.get("dependencies"):
+        try:
+            if isinstance(dependencies, str):
+                dependencies_dict = json.loads(dependencies)  # type: ignore
+                kwargs["dependencies"] = dependencies_dict
+        except json.JSONDecodeError:
+            kwargs.pop("dependencies")
+            log_warning(f"Invalid dependencies parameter couldn't be loaded: {dependencies}")
+
+    if metadata := kwargs.get("metadata"):
+        try:
+            if isinstance(metadata, str):
+                metadata_dict = json.loads(metadata)  # type: ignore
+                kwargs["metadata"] = metadata_dict
+        except json.JSONDecodeError:
+            kwargs.pop("metadata")
+            log_warning(f"Invalid metadata parameter couldn't be loaded: {metadata}")
+
+    if knowledge_filters := kwargs.get("knowledge_filters"):
+        try:
+            if isinstance(knowledge_filters, str):
+                knowledge_filters_dict = json.loads(knowledge_filters)  # type: ignore
+
+                # Try to deserialize FilterExpr objects
+                from agno.filters import from_dict
+
+                # Check if it's a single FilterExpr dict or a list of FilterExpr dicts
+                if isinstance(knowledge_filters_dict, dict) and "op" in knowledge_filters_dict:
+                    # Single FilterExpr - convert to list format
+                    kwargs["knowledge_filters"] = [from_dict(knowledge_filters_dict)]
+                elif isinstance(knowledge_filters_dict, list):
+                    # List of FilterExprs or mixed content
+                    deserialized = []
+                    for item in knowledge_filters_dict:
+                        if isinstance(item, dict) and "op" in item:
+                            deserialized.append(from_dict(item))
+                        else:
+                            # Keep non-FilterExpr items as-is
+                            deserialized.append(item)
+                    kwargs["knowledge_filters"] = deserialized
+                else:
+                    # Regular dict filter
+                    kwargs["knowledge_filters"] = knowledge_filters_dict
+        except json.JSONDecodeError:
+            kwargs.pop("knowledge_filters")
+            log_warning(f"Invalid knowledge_filters parameter couldn't be loaded: {knowledge_filters}")
+        except ValueError as e:
+            # Filter deserialization failed
+            kwargs.pop("knowledge_filters")
+            log_warning(f"Invalid FilterExpr in knowledge_filters: {e}")
+
+    # Handle output_schema - convert JSON schema to Pydantic model or keep as dict
+    # use_json_schema is a control flag consumed here (not passed to Agent/Team)
+    # When true, output_schema stays as dict for direct JSON output
+    use_json_schema = kwargs.pop("use_json_schema", False)
+    if isinstance(use_json_schema, str):
+        use_json_schema = use_json_schema.lower() == "true"
+
+    if output_schema := kwargs.get("output_schema"):
+        try:
+            if isinstance(output_schema, str):
+                schema_dict = json.loads(output_schema)
+
+                if use_json_schema:
+                    # Keep as dict schema for direct JSON output
+                    kwargs["output_schema"] = schema_dict
+                else:
+                    # Convert to Pydantic model (default behavior)
+                    dynamic_model = json_schema_to_pydantic_model(schema_dict)
+                    kwargs["output_schema"] = dynamic_model
+        except json.JSONDecodeError:
+            kwargs.pop("output_schema")
+            log_warning(f"Invalid output_schema JSON: {output_schema}")
+        except Exception as e:
+            kwargs.pop("output_schema")
+            log_warning(f"Failed to create output_schema model: {e}")
+
+    # Parse boolean and null values
+    for key, value in kwargs.items():
+        if isinstance(value, str) and value.lower() in ["true", "false"]:
+            kwargs[key] = value.lower() == "true"
+        elif isinstance(value, str) and value.lower() in ["null", "none"]:
+            kwargs[key] = None
+
+    return kwargs
+
+
+def format_sse_event(event: Union[RunOutputEvent, TeamRunOutputEvent, WorkflowRunOutputEvent]) -> str:
+    """Parse JSON data into SSE-compliant format.
+
+    Args:
+        event_dict: Dictionary containing the event data
+
+    Returns:
+        SSE-formatted response:
+
+        ```
+        event: EventName
+        data: { ... }
+
+        event: AnotherEventName
+        data: { ... }
+        ```
+    """
+    try:
+        # Parse the JSON to extract the event type
+        event_type = event.event or "message"
+
+        # Serialize to valid JSON with double quotes and no newlines
+        clean_json = event.to_json(separators=(",", ":"), indent=None)
+
+        return f"event: {event_type}\ndata: {clean_json}\n\n"
+    except json.JSONDecodeError:
+        clean_json = event.to_json(separators=(",", ":"), indent=None)
+        return f"event: message\ndata: {clean_json}\n\n"
 
 
 async def get_db(
@@ -144,56 +300,45 @@ def get_session_name(session: Dict[str, Any]) -> str:
     if session_data is not None and session_data.get("session_name") is not None:
         return session_data["session_name"]
 
-    # Otherwise use the original user message
-    else:
-        runs = session.get("runs", []) or []
+    runs = session.get("runs", []) or []
+    session_type = session.get("session_type")
 
-        # For teams, identify the first Team run and avoid using the first member's run
-        if session.get("session_type") == "team":
-            run = None
-            for r in runs:
-                # If agent_id is not present, it's a team run
-                if not r.get("agent_id"):
-                    run = r
-                    break
-
-            # Fallback to first run if no team run found
-            if run is None and runs:
-                run = runs[0]
-
-        elif session.get("session_type") == "workflow":
-            try:
-                workflow_run = runs[0]
-                workflow_input = workflow_run.get("input")
-                if isinstance(workflow_input, str):
-                    return workflow_input
-                elif isinstance(workflow_input, dict):
-                    try:
-                        import json
-
-                        return json.dumps(workflow_input)
-                    except (TypeError, ValueError):
-                        pass
-
-                workflow_name = session.get("workflow_data", {}).get("name")
-                return f"New {workflow_name} Session" if workflow_name else ""
-            except (KeyError, IndexError, TypeError):
-                return ""
-
-        # For agents, use the first run
-        else:
-            run = runs[0] if runs else None
-
-        if run is None:
+    # Handle workflows separately
+    if session_type == "workflow":
+        if not runs:
             return ""
+        workflow_run = runs[0]
+        workflow_input = workflow_run.get("input")
+        if isinstance(workflow_input, str):
+            return workflow_input
+        elif isinstance(workflow_input, dict):
+            try:
+                return json.dumps(workflow_input)
+            except (TypeError, ValueError):
+                pass
+        workflow_name = session.get("workflow_data", {}).get("name")
+        return f"New {workflow_name} Session" if workflow_name else ""
 
-        if not isinstance(run, dict):
-            run = run.to_dict()
+    # For team, filter to team runs (runs without agent_id); for agents, use all runs
+    if session_type == "team":
+        runs_to_check = [r for r in runs if not r.get("agent_id")]
+    else:
+        runs_to_check = runs
 
-        if run and run.get("messages"):
-            for message in run["messages"]:
-                if message["role"] == "user":
-                    return message["content"]
+    # Find the first user message across runs
+    for r in runs_to_check:
+        if r is None:
+            continue
+        run_dict = r if isinstance(r, dict) else r.to_dict()
+
+        for message in run_dict.get("messages") or []:
+            if message.get("role") == "user" and message.get("content"):
+                return message["content"]
+
+        run_input = r.get("input")
+        if run_input is not None:
+            return run_input.get("input_content")
+
     return ""
 
 
@@ -411,6 +556,31 @@ def _generate_schema_from_params(params: Dict[str, Any]) -> Dict[str, Any]:
         schema["required"] = required
 
     return schema
+
+
+def resolve_origins(user_origins: Optional[List[str]] = None, default_origins: Optional[List[str]] = None) -> List[str]:
+    """
+    Get CORS origins - user-provided origins override defaults.
+
+    Args:
+        user_origins: Optional list of user-provided CORS origins
+
+    Returns:
+        List of allowed CORS origins (user-provided if set, otherwise defaults)
+    """
+    # User-provided origins override defaults
+    if user_origins:
+        return user_origins
+
+    # Default Agno domains
+    return default_origins or [
+        "http://localhost:3000",
+        "https://agno.com",
+        "https://www.agno.com",
+        "https://app.agno.com",
+        "https://os-stg.agno.com",
+        "https://os.agno.com",
+    ]
 
 
 def update_cors_middleware(app: FastAPI, new_origins: list):
@@ -700,7 +870,7 @@ def _get_python_type_from_json_schema(field_schema: Dict[str, Any], field_name: 
         # Unknown or unspecified type - fallback to Any
         if json_type:
             logger.warning(f"Unknown JSON schema type '{json_type}' for field '{field_name}', using Any")
-        return Any
+        return Any  # type: ignore
 
 
 def json_schema_to_pydantic_model(schema: Dict[str, Any]) -> Type[BaseModel]:
